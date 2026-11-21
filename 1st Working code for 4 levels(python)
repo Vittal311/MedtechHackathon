@@ -1,0 +1,69 @@
+import os
+import time
+import numpy as np
+from arduino.app_utils import App, Bridge
+from edge_impulse_linux.runner import ImpulseRunner
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.eim")
+os.chmod(MODEL_PATH, 0o755)   # make the model executable
+WINDOW_SAMPLES = 100       # 100 samples @ 100 Hz = 1000 ms (Window size)
+SLIDE_SAMPLES = 50         # 50 samples @ 100 Hz = 500 ms (Window increase)
+EAV_POINTS_LIMIT = 100.0   # UK HSE 行动值阈值 (2.5 m/s^2 A(8) = 100 分)
+
+sample_buffer = []
+hse_points = 0.0
+alert_triggered = False
+
+# 启动时加载本地 .eim 神经网络模型
+runner = ImpulseRunner(MODEL_PATH)
+model_info = runner.init()
+print(f"Loaded Edge Impulse model: {model_info['project']['name']}")
+
+
+def on_imu_sample(ax: float, ay: float, az: float):
+    global sample_buffer, hse_points, alert_triggered
+
+    sample_buffer.append([ax, ay, az])
+
+    # 攒满 1000 ms（100 个点）后运行推理，每次滑动 500 ms（50 个点）
+    if len(sample_buffer) >= WINDOW_SAMPLES:
+        window = np.array(sample_buffer[:WINDOW_SAMPLES], dtype=np.float32)
+        sample_buffer = sample_buffer[SLIDE_SAMPLES:]
+
+        # 去除 9.81 m/s^2 静态重力分量，计算动态振动有效值 RMS (m/s^2)
+        dynamic_acc = window - np.mean(window, axis=0)
+        rms_ms2 = float(np.sqrt(np.mean(np.sum(dynamic_acc ** 2, axis=1))))
+
+        # 展平为 [x0, y0, z0, x1, y1, z1, ...] 输入模型进行离线分类
+        features = window.flatten().tolist()
+        res = runner.classify(features)
+        scores = res["result"]["classification"]
+        top_class = max(scores, key=scores.get)
+        confidence = scores[top_class]
+
+        # 识别到高危工具工作时，按 UK HSE 公式累计暴露分数
+        if top_class != "0_Idle_Safe" and confidence > 0.60:
+            step_hours = 0.5 / 3600.0
+            hse_points += 2.0 * (rms_ms2 ** 2) * step_hours
+
+        print(
+            f"Tool: {top_class} ({confidence:.0%}) | "
+            f"a_hv: {rms_ms2:.2f} m/s^2 | "
+            f"HSE Points: {hse_points:.2f} / {EAV_POINTS_LIMIT:.0f}"
+        )
+
+        # 达到阈值时通知 MCU 触发蜂鸣器警报
+        if hse_points >= EAV_POINTS_LIMIT and not alert_triggered:
+            alert_triggered = True
+            Bridge.notify("set_alert", 1)
+            print("WARNING: UK HSE Exposure Action Value (100 points) reached!")
+
+
+Bridge.provide("imu_sample", on_imu_sample)
+
+
+def loop():
+    time.sleep(0.05)
+
+
+App.run(user_loop=loop)
