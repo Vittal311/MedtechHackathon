@@ -1,0 +1,50 @@
+#include <Arduino_RouterBridge.h>
+#include <Modulino.h>
+
+ModulinoMovement imu;
+ModulinoBuzzer buzzer; // Optional: connect Modulino Buzzer on the Qwiic chain
+
+unsigned long lastSampleMs = 0;
+const unsigned long SAMPLE_INTERVAL_MS = 10; // 10 ms = 100 Hz (must match Edge Impulse frequency)
+const float G_TO_MS2 = 9.80665f;
+
+volatile bool alertActive = false;
+
+// Callback triggered by Python when UK HSE exposure threshold is exceeded
+void set_alert(int state) {
+  alertActive = (state > 0);
+}
+
+void setup() {
+  Bridge.begin();
+  Monitor.begin();
+
+  Modulino.begin();
+  if (!imu.begin()) {
+    Monitor.println("ERROR: Modulino Movement (ABX00101) not detected!");
+  }
+  buzzer.begin();
+
+  Bridge.provide_safe("set_alert", set_alert);
+  Monitor.println("MCU 100 Hz IMU streamer ready.");
+}
+
+void loop() {
+  unsigned long now = millis();
+  if (now - lastSampleMs >= SAMPLE_INTERVAL_MS) {
+    lastSampleMs += SAMPLE_INTERVAL_MS;
+
+    imu.update();
+    float ax = imu.getX() * G_TO_MS2;
+    float ay = imu.getY() * G_TO_MS2;
+    float az = imu.getZ() * G_TO_MS2;
+
+    // Stream 3-axis acceleration (in m/s^2) to the Linux MPU
+    Bridge.notify("imu_sample", ax, ay, az);
+  }
+
+  // Sound audible alarm if cumulative vibration exposure reaches the limit
+  if (alertActive) {
+    buzzer.tone(2000, 100);
+  }
+}
